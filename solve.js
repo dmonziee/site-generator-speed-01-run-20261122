@@ -7,30 +7,27 @@ const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June',
 
 // ---------- text ----------
 const ESCMAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
+// Fast path: most strings have no HTML special at all — one native test
+// returns them untouched. Only strings holding a special pay for replace.
+const ESC_TEST = /[&<>"']/;
+const ESC_RE = /[&<>"']/g;
 function esc(s) {
-  let out = '';
-  let start = 0;
-  for (let i = 0; i < s.length; i++) {
-    const c = s[i];
-    let ent = null;
-    if (c === '&') ent = '&amp;';
-    else if (c === '<') ent = '&lt;';
-    else if (c === '>') ent = '&gt;';
-    else if (c === '"') ent = '&quot;';
-    else if (c === "'") ent = '&#39;';
-    if (ent !== null) {
-      out += s.slice(start, i) + ent;
-      start = i + 1;
-    }
-  }
-  if (start === 0) return s;
-  return out + s.slice(start);
+  if (!ESC_TEST.test(s)) return s;
+  return s.replace(ESC_RE, c => ESCMAP[c]);
 }
 
 function isLeap(y) { return (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0; }
 const MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
 
 function slugOf(text) {
+  const cached = SLUG_CACHE.get(text);
+  if (cached !== undefined) return cached;
+  const result = slugOfCompute(text);
+  SLUG_CACHE.set(text, result);
+  return result;
+}
+const SLUG_CACHE = new Map();
+function slugOfCompute(text) {
   const norm = text.normalize('NFKD').replace(/\p{M}/gu, '');
   let out = '';
   let lastDash = true; // suppress a leading dash
@@ -301,31 +298,49 @@ function renderNodes(nodes, scope, templates, depth, out) {
 // for/if bodies — those are inlined as JS control flow). The generated
 // code calls the same resolvePath/writeValue/esc/isTruthy helpers, so
 // its output is identical to renderNodes.
-function compileNodes(nodes, parts) {
+// Resolve a template path to a JS expression. When the first segment
+// can never be a loop variable (it is not 'loop' and no template in this
+// case uses it as a for-variable — collected at runtime), the value can
+// only come from scope.vals, so a direct access chain replaces the
+// resolvePath call (no loop scan, no hasOwnProperty chain, no path-array
+// allocation per evaluation). Optional chaining reproduces resolvePath's
+// behaviour for missing/null intermediates. Otherwise resolvePath is
+// kept, so loop variables and 'loop' still resolve through the frames.
+function accessExpr(path, loopVars) {
+  const first = path[0];
+  if (first === 'loop' || loopVars.has(first)) {
+    return 'resolvePath(scope,' + JSON.stringify(path) + ')';
+  }
+  let expr = 'scope.vals.' + first;
+  for (let k = 1; k < path.length; k++) expr += '?.' + path[k];
+  return expr;
+}
+
+function compileNodes(nodes, parts, loopVars) {
   for (let ni = 0; ni < nodes.length; ni++) {
     const node = nodes[ni];
     const t = node.t;
     if (t === 0) { parts.push('out.push(' + JSON.stringify(node.s) + ');'); continue; }
     if (t === 1) {
-      const p = JSON.stringify(node.path);
+      const e = accessExpr(node.path, loopVars);
       parts.push(node.raw
-        ? 'out.push(writeValue(resolvePath(scope,' + p + ')));'
-        : 'out.push(esc(writeValue(resolvePath(scope,' + p + '))));');
+        ? 'out.push(writeValue(' + e + '));'
+        : 'out.push(esc(writeValue(' + e + ')));');
       continue;
     }
     if (t === 2) {
-      const p = JSON.stringify(node.path);
-      parts.push('{const _a=resolvePath(scope,' + p + ');if(Array.isArray(_a)){const _l=_a.length;const _o={index:1,first:true,last:_l===1,length:_l};const _f={v:' + JSON.stringify(node.v) + ',val:null,loop:_o};scope.loops.push(_f);for(let _i=0;_i<_l;_i++){_o.index=_i+1;_o.first=_i===0;_o.last=_i===_l-1;_f.val=_a[_i];');
-      compileNodes(node.body, parts);
+      const e = accessExpr(node.path, loopVars);
+      parts.push('{const _a=' + e + ';if(Array.isArray(_a)){const _l=_a.length;const _o={index:1,first:true,last:_l===1,length:_l};const _f={v:' + JSON.stringify(node.v) + ',val:null,loop:_o};scope.loops.push(_f);for(let _i=0;_i<_l;_i++){_o.index=_i+1;_o.first=_i===0;_o.last=_i===_l-1;_f.val=_a[_i];');
+      compileNodes(node.body, parts, loopVars);
       parts.push('}scope.loops.pop();}}');
       continue;
     }
     if (t === 3) {
-      const p = JSON.stringify(node.path);
-      parts.push('{let _c=isTruthy(resolvePath(scope,' + p + '));' + (node.neg ? '_c=!_c;' : '') + 'if(_c){');
-      compileNodes(node.then, parts);
+      const e = accessExpr(node.path, loopVars);
+      parts.push('{let _c=isTruthy(' + e + ');' + (node.neg ? '_c=!_c;' : '') + 'if(_c){');
+      compileNodes(node.then, parts, loopVars);
       parts.push('}else{');
-      compileNodes(node.els || EMPTY_NODES, parts);
+      compileNodes(node.els || EMPTY_NODES, parts, loopVars);
       parts.push('}}');
       continue;
     }
@@ -334,9 +349,9 @@ function compileNodes(nodes, parts) {
   }
 }
 
-function compileTemplate(nodes) {
+function compileTemplate(nodes, loopVars) {
   const parts = [];
-  compileNodes(nodes, parts);
+  compileNodes(nodes, parts, loopVars);
   // resolvePath/writeValue/esc/isTruthy/compiled are free variables, bound
   // below via the Function constructor's parameters.
   const fn = new Function('scope', 'templates', 'compiled', 'depth', 'out', 'resolvePath', 'writeValue', 'esc', 'isTruthy', parts.join(''));
@@ -366,30 +381,58 @@ function resolveRel(dir, path) {
 }
 
 function resolveHref(target, ctx) {
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target)) return target;
+  // Link targets repeat across hundreds of pages; the resolution depends
+  // only on (srcDir, target) within a case, so memoize it. A cached
+  // "broken" still records this page's broken-link report line, because
+  // the report names the linking page.
+  const cache = ctx.hrefCache;
+  const key = ctx.srcDir + '\0' + target;
+  const hit = cache.get(key);
+  if (hit !== undefined) {
+    if (hit === null) ctx.broken.add('broken-link ' + ctx.srcPath + ' -> ' + target);
+    return hit === null ? target : hit;
+  }
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target)) { cache.set(key, target); return target; }
   const c0 = target.charCodeAt(0);
-  if (c0 === 47 || c0 === 35) return target; // / or #
+  if (c0 === 47 || c0 === 35) { cache.set(key, target); return target; } // / or #
   let path = target, frag = '';
   const hi = target.indexOf('#');
   if (hi !== -1) { path = target.slice(0, hi); frag = target.slice(hi); }
   const resolved = resolveRel(ctx.srcDir, path);
   const url = ctx.pageBySource.get(resolved);
-  if (url !== undefined) return url + frag;
-  if (ctx.staticSet.has(resolved)) return ctx.base + '/' + resolved + frag;
+  if (url !== undefined) { const r = url + frag; cache.set(key, r); return r; }
+  if (ctx.staticSet.has(resolved)) { const r = ctx.base + '/' + resolved + frag; cache.set(key, r); return r; }
+  cache.set(key, null);
   ctx.broken.add('broken-link ' + ctx.srcPath + ' -> ' + target);
   return target;
 }
 
+const INLINE_TEST = /[\\`*\[&<>"']/;
+const CONSTRUCT_TEST = /[\\`*[]/;
+// One shared global regex for the inline scan. Safe to share across the
+// (recursive) renderInline calls: every exec is preceded by setting
+// lastIndex, so a nested call cannot corrupt the outer scan.
+const INLINE_RE = /[\\`*\[&<>"']/g;
 function renderInline(s, ctx) {
   const n = s.length;
+  // Fast path: text with no special character at all is already its own
+  // output — no construct can start and nothing needs escaping. One
+  // native test replaces the regex creation, the exec, the slice and
+  // the concatenation of the slow path.
+  if (!INLINE_TEST.test(s)) return s;
+  // Second fast path: text holding only HTML specials (&, <, >, ", ')
+  // and no construct starter (\, `, *, [) renders as a plain escape —
+  // one native replace instead of the jump-between-specials loop.
+  if (!CONSTRUCT_TEST.test(s)) return esc(s);
   // Jump between special characters with a regex (scanned in C++), instead
   // of walking plain text one character at a time in JS. The regex matches
   // every character that needs attention — a construct starter (\\, `, *,
   // [) or an HTML special (&, <, >, ", ') — so the plain text between two
   // matches holds no special at all and is appended as-is, with no esc()
-  // scan. A fresh regex per call: renderInline recurses, and a shared
-  // global regex's lastIndex would be clobbered.
-  const re = /[\\`*\[&<>"']/g;
+  // scan. The regex is shared (module level): every exec is preceded by
+  // setting lastIndex, so a nested (recursive) call cannot corrupt the
+  // outer scan.
+  const re = INLINE_RE;
   let out = '';
   let i = 0;
   // A character at position p is escaped when an odd run of backslashes
@@ -452,11 +495,17 @@ function renderInline(s, ctx) {
     if (c === 42) { // *
       if (s.charCodeAt(j + 1) === 42) { // ** strong
         if (s.charCodeAt(j + 2) === 42 && s.charCodeAt(j + 3) === 42) { out += '**'; i = j + 2; continue; }
-        let k = j + 2, found = -1;
-        while (k < n - 1) {
-          if (s.charCodeAt(k) === 92 && k + 1 < n && ESC_CODE[s.charCodeAt(k + 1)] === 1) { k += 2; continue; }
-          if (s.charCodeAt(k) === 42 && s.charCodeAt(k + 1) === 42) { found = k; break; }
-          k++;
+        // Find the closer with indexOf (native scan). When a found '**'
+        // starts on an escaped star, resume at f+1, not f+2: the second
+        // star of the escaped pair can itself open a '**' (e.g. in
+        // '\***', the pair at f is escaped but the pair at f+1 closes).
+        let found = -1;
+        let k = j + 2;
+        while (true) {
+          const f = s.indexOf('**', k);
+          if (f === -1 || f >= n - 1) break;
+          if (!isEscaped(f)) { found = f; break; }
+          k = f + 1;
         }
         if (found !== -1 && found > j + 2) {
           out += '<strong>' + renderInline(s.slice(j + 2, found), ctx) + '</strong>';
@@ -468,11 +517,14 @@ function renderInline(s, ctx) {
         continue;
       }
       if (!isSingleStar(j)) { out += '*'; i = j + 1; continue; }
-      let k = j + 1, found = -1;
-      while (k < n) {
-        if (s.charCodeAt(k) === 92 && k + 1 < n && ESC_CODE[s.charCodeAt(k + 1)] === 1) { k += 2; continue; }
-        if (s.charCodeAt(k) === 42 && isSingleStar(k)) { found = k; break; }
-        k++;
+      // Em closer: indexOf for the next star, keeping only single stars.
+      let found = -1;
+      let k = j + 1;
+      while (true) {
+        const f = s.indexOf('*', k);
+        if (f === -1) break;
+        if (isSingleStar(f)) { found = f; break; }
+        k = f + 1;
       }
       if (found !== -1 && found > j + 1) {
         out += '<em>' + renderInline(s.slice(j + 1, found), ctx) + '</em>';
@@ -652,11 +704,14 @@ function renderMarkdown(body, ctx) {
       const fenceLines = [];
       i++;
       while (i < n && !isFenceClose(lines[i])) {
-        fenceLines.push(esc(lines[i]));
+        fenceLines.push(lines[i]);
         i++;
       }
       if (i < n) i++; // skip the closing fence
-      const content = fenceLines.length ? fenceLines.join('\n') + '\n' : '';
+      // Escape the joined content in one call instead of once per line:
+      // esc only touches &, <, >, ", ' and never '\n', so escaping the
+      // joined text is identical to escaping each line then joining.
+      const content = fenceLines.length ? esc(fenceLines.join('\n') + '\n') : '';
       blocks.push('<pre><code' + (lang !== '' ? ' class="language-' + lang + '"' : '') + '>' + content + '</code></pre>');
       continue;
     }
@@ -953,15 +1008,7 @@ export function run(input) {
   const output = {};
   const report = [];
   const broken = new Set();
-  // Tag names repeat across hundreds of pages; slugOf does a Unicode
-  // normalize + regex per call, so memoize it (titles/headings are unique
-  // and do not go through this cache).
-  const slugCache = new Map();
-  function slugCached(s) {
-    let v = slugCache.get(s);
-    if (v === undefined) { v = slugOf(s); slugCache.set(s, v); }
-    return v;
-  }
+  const hrefCache = new Map();
 
   // templates, parsed in code-unit order of name
   const templates = new Map();
@@ -972,9 +1019,19 @@ export function run(input) {
     if (!p.ok) report.push('template "' + name + '": ' + p.reason);
     else templates.set(name, p.nodes);
   }
-  // compiled render functions, one per parsed template
+  // compiled render functions, one per parsed template. Collect every
+  // for-variable name used by any template first: a path whose first
+  // segment is never a for-variable can be resolved by direct access
+  // (see accessExpr); 'loop' and any for-variable keep resolvePath.
+  const loopVars = new Set();
+  (function collect(nodes) {
+    for (const nd of nodes) {
+      if (nd.t === 2) { loopVars.add(nd.v); collect(nd.body); }
+      else if (nd.t === 3) { collect(nd.then); if (nd.els) collect(nd.els); }
+    }
+  })([...templates.values()].flat());
   const compiled = new Map();
-  for (const [name, nodes] of templates) compiled.set(name, compileTemplate(nodes));
+  for (const [name, nodes] of templates) compiled.set(name, compileTemplate(nodes, loopVars));
 
   // sources, sorted by path in code-unit order
   const files = input.files.slice().sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
@@ -1043,7 +1100,7 @@ export function run(input) {
   for (let i = 0; i < kept.length; i++) pageBySource.set(kept[i].path, kept[i].url);
   for (let i = 0; i < kept.length; i++) {
     const k = kept[i];
-    const ctx = { srcPath: k.path, srcDir: k.srcDir, pageBySource, staticSet, base, broken };
+    const ctx = { srcPath: k.path, srcDir: k.srcDir, pageBySource, staticSet, base, broken, hrefCache };
     const md = renderMarkdown(k.body, ctx);
     k.content = md.html;
     k.toc = md.toc;
@@ -1071,7 +1128,7 @@ export function run(input) {
     const seenSlugs = new Set();
     for (let j = 0; j < tags.length; j++) {
       const name = tags[j];
-      const slug = slugCached(name);
+      const slug = slugOf(name);
       if (seenSlugs.has(slug)) continue;
       seenSlugs.add(slug);
       if (!tagBySlug.has(slug)) {
@@ -1098,7 +1155,7 @@ export function run(input) {
     const seenCardSlugs = new Set();
     const tags = k.data.tags || [];
     for (let j = 0; j < tags.length; j++) {
-      const slug = slugCached(tags[j]);
+      const slug = slugOf(tags[j]);
       if (seenCardSlugs.has(slug)) continue;
       seenCardSlugs.add(slug);
       const t = tagBySlug.get(slug);
@@ -1144,17 +1201,18 @@ export function run(input) {
 
   const siteTpl = { title: site.title, base_url: base };
   const recentCards = recent.map(r => cardByPage.get(r));
+  // One reusable render context per layout family: only `page` changes
+  // per page, and for/if bodies push/pop their frames, so `loops` is
+  // empty again after each render.
+  const layoutCtx = { vals: { site: siteTpl, tags: tagsForTpl, recent: recentCards, page: null }, loops: [] };
 
   // layouts: every page through its layout
   for (let i = 0; i < kept.length; i++) {
     const k = kept[i];
     const fn = compiled.get(k.layoutName);
     if (!fn) continue;
-    const ctx = { vals: {
-      site: siteTpl, tags: tagsForTpl, recent: recentCards,
-      page: pageValueOf(k)
-    }, loops: [] };
-    const _o1 = []; fn(ctx, templates, compiled, 0, _o1); output[k.outPath] = _o1.join('');
+    layoutCtx.vals.page = pageValueOf(k);
+    const _o1 = []; fn(layoutCtx, templates, compiled, 0, _o1); output[k.outPath] = _o1.join('');
   }
 
   // index pages
