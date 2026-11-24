@@ -88,7 +88,7 @@ function parseTemplate(src) {
       if (e === -1) return { ok: false, reason: triple ? 'a {{{ is not closed' : 'a {{ is not closed' };
       const inner = src.slice(j + (triple ? 3 : 2), e).trim();
       const path = parsePath(inner);
-      if (!path) return { ok: false, reason: 'a path is not one' };
+      if (!path) return { ok: false, reason: JSON.stringify(inner) + ' is not a path' };
       pushText(textStart, j);
       toks.push({ t: 1, path, raw: triple });
       i = e + closeStr.length;
@@ -123,23 +123,23 @@ function parseTemplate(src) {
       else if (inner === 'endif') tag = { t: 'endif' };
       else if (inner === 'endfor') tag = { t: 'endfor' };
       else if (inner.startsWith('for ')) {
-        const m = /^for\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+(.+)$/.exec(inner);
-        if (!m) return { ok: false, reason: 'a tag is none of the above' };
-        const path = parsePath(m[2].trim());
-        if (!path) return { ok: false, reason: 'a path is not one' };
+        const m = /^for ([A-Za-z_][A-Za-z0-9_]*) in (\S+)$/.exec(inner);
+        if (!m) return { ok: false, reason: '{% ' + inner + ' %} is not a tag' };
+        const path = parsePath(m[2]);
+        if (!path) return { ok: false, reason: JSON.stringify(m[2]) + ' is not a path' };
         tag = { t: 'for', v: m[1], path };
       } else if (inner.startsWith('if ')) {
-        const m = /^if\s+(not\s+)?(.+)$/.exec(inner);
-        if (!m) return { ok: false, reason: 'a tag is none of the above' };
-        const path = parsePath(m[2].trim());
-        if (!path) return { ok: false, reason: 'a path is not one' };
+        const m = /^if (not )?(\S+)$/.exec(inner);
+        if (!m) return { ok: false, reason: '{% ' + inner + ' %} is not a tag' };
+        const path = parsePath(m[2]);
+        if (!path) return { ok: false, reason: JSON.stringify(m[2]) + ' is not a path' };
         tag = { t: 'if', path, neg: !!m[1] };
       } else if (inner.startsWith('include ')) {
-        const m = /^include\s+"([^"]*)"$/.exec(inner);
-        if (!m) return { ok: false, reason: 'a tag is none of the above' };
+        const m = /^include "([a-z0-9-]+)"$/.exec(inner);
+        if (!m) return { ok: false, reason: '{% ' + inner + ' %} is not a tag' };
         tag = { t: 'include', name: m[1] };
       } else {
-        return { ok: false, reason: 'a tag is none of the above' };
+        return { ok: false, reason: '{% ' + inner + ' %} is not a tag' };
       }
       if (alone) {
         // the text before loses the spaces/tabs after its last \n
@@ -180,27 +180,27 @@ function parseTemplate(src) {
     if (tok.t === 'include') { curList().push({ t: 4, name: tok.name }); continue; }
     if (tok.t === 'else') {
       const f = cur();
-      if (f.type !== 'if' || f.inElse) return { ok: false, reason: 'a tag is closed out of order' };
+      if (f.type !== 'if' || f.inElse) return { ok: false, reason: 'an else outside an if' };
       f.inElse = true;
       f.els = [];
       continue;
     }
     if (tok.t === 'endif') {
       const f = cur();
-      if (f.type !== 'if') return { ok: false, reason: 'a tag is closed out of order' };
+      if (f.type !== 'if') return { ok: false, reason: 'an endif with no open if' };
       stack.pop();
       curList().push({ t: 3, path: f.path, neg: f.neg, then: f.then, els: f.els });
       continue;
     }
     if (tok.t === 'endfor') {
       const f = cur();
-      if (f.type !== 'for') return { ok: false, reason: 'a tag is closed out of order' };
+      if (f.type !== 'for') return { ok: false, reason: 'an endfor with no open for' };
       stack.pop();
       curList().push({ t: 2, v: f.v, path: f.path, body: f.nodes });
       continue;
     }
   }
-  if (stack.length !== 1) return { ok: false, reason: 'a for or if is not closed' };
+  if (stack.length !== 1) return { ok: false, reason: 'a ' + stack[stack.length - 1].type + ' is not closed' };
   return { ok: true, nodes: root.nodes };
 }
 
@@ -413,6 +413,29 @@ const CONSTRUCT_TEST = /[\\`*[]/;
 // (recursive) renderInline calls: every exec is preceded by setting
 // lastIndex, so a nested call cannot corrupt the outer scan.
 const INLINE_RE = /[\\`*\[&<>"']/g;
+// A character at position p is escaped when an odd run of backslashes
+// stands right before it (the backslashes pair up as escaped backslashes).
+// Module level (takes s explicitly) so renderInline does not allocate two
+// closures on every call.
+function isEscaped(s, p) {
+  let b = 0;
+  let k = p - 1;
+  while (k >= 0 && s.charCodeAt(k) === 92) { b++; k--; }
+  return (b % 2) === 1;
+}
+// A * is single when it is the leftover of its run of unescaped stars:
+// the run is paired off from its start, so a single star is the last
+// star of an odd-length run (a lone star, or the third of ***).
+function isSingleStar(s, n, p) {
+  if (s.charCodeAt(p) !== 42 || isEscaped(s, p)) return false;
+  let start2 = p;
+  while (start2 > 0 && s.charCodeAt(start2 - 1) === 42 && !isEscaped(s, start2 - 1)) start2--;
+  let end = p;
+  while (end < n && s.charCodeAt(end) === 42 && !isEscaped(s, end)) end++;
+  const len = end - start2;
+  return (len % 2 === 1) && p === end - 1;
+}
+
 function renderInline(s, ctx) {
   const n = s.length;
   // Fast path: text with no special character at all is already its own
@@ -435,26 +458,6 @@ function renderInline(s, ctx) {
   const re = INLINE_RE;
   let out = '';
   let i = 0;
-  // A character at position p is escaped when an odd run of backslashes
-  // stands right before it (the backslashes pair up as escaped backslashes).
-  function isEscaped(p) {
-    let b = 0;
-    let k = p - 1;
-    while (k >= 0 && s.charCodeAt(k) === 92) { b++; k--; }
-    return (b % 2) === 1;
-  }
-  // A * is single when it is the leftover of its run of unescaped stars:
-  // the run is paired off from its start, so a single star is the last
-  // star of an odd-length run (a lone star, or the third of ***).
-  function isSingleStar(p) {
-    if (s.charCodeAt(p) !== 42 || isEscaped(p)) return false;
-    let start2 = p;
-    while (start2 > 0 && s.charCodeAt(start2 - 1) === 42 && !isEscaped(start2 - 1)) start2--;
-    let end = p;
-    while (end < n && s.charCodeAt(end) === 42 && !isEscaped(end)) end++;
-    const len = end - start2;
-    return (len % 2 === 1) && p === end - 1;
-  }
   while (i < n) {
     re.lastIndex = i;
     const m = re.exec(s);
@@ -504,7 +507,7 @@ function renderInline(s, ctx) {
         while (true) {
           const f = s.indexOf('**', k);
           if (f === -1 || f >= n - 1) break;
-          if (!isEscaped(f)) { found = f; break; }
+          if (!isEscaped(s, f)) { found = f; break; }
           k = f + 1;
         }
         if (found !== -1 && found > j + 2) {
@@ -516,14 +519,14 @@ function renderInline(s, ctx) {
         }
         continue;
       }
-      if (!isSingleStar(j)) { out += '*'; i = j + 1; continue; }
+      if (!isSingleStar(s, n, j)) { out += '*'; i = j + 1; continue; }
       // Em closer: indexOf for the next star, keeping only single stars.
       let found = -1;
       let k = j + 1;
       while (true) {
         const f = s.indexOf('*', k);
         if (f === -1) break;
-        if (isSingleStar(f)) { found = f; break; }
+        if (isSingleStar(s, n, f)) { found = f; break; }
         k = f + 1;
       }
       if (found !== -1 && found > j + 1) {
@@ -690,7 +693,7 @@ function renderMarkdown(body, ctx) {
   let inWord = false;
   for (let i = 0; i < body.length; i++) {
     const c = body.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 13 || c === 11 || c === 12;
+    const ws = c === 32 || (c >= 9 && c <= 13);
     if (!ws && !inWord) { words++; inWord = true; }
     else if (ws) inWord = false;
   }
